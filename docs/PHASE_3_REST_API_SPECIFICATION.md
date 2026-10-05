@@ -353,7 +353,7 @@ The following matrix maps every API resource to the authoritative Phase 1 RBAC r
 | `/api/v1/auth/refresh` | `POST` | Public | Public | Public | Public | Public | Token family rotation & replay detection |
 | `/api/v1/auth/logout` | `POST` | Member | Member | Member | Member | Member | Revokes token family |
 | `/api/v1/auth/me` | `GET` | Authenticated | Authenticated | Authenticated | Authenticated | Authenticated | Retrieves current caller profile |
-| `/api/v1/users` | `GET` | All | Active Only | Active Only | Active Only | Active Only | User assignment directory |
+| `/api/v1/users` | `GET` | All | Active Only | Active Only | Active Only | Active Only | Active user directory (system-wide assignment directory) |
 | `/api/v1/users/:userId/status` | `PATCH` | Allowed | Denied (403) | Denied (403) | Denied (403) | Denied (403) | Admin-only account lifecycle governance |
 | `/api/v1/projects` | `POST` | Allowed | Allowed | Allowed | Denied (403) | Denied (403) | Project creation; creator assigned `Lead` |
 | `/api/v1/projects` | `GET` | All Projects | Enrolled | Enrolled | Enrolled | Enrolled | List accessible project workspaces |
@@ -364,7 +364,7 @@ The following matrix maps every API resource to the authoritative Phase 1 RBAC r
 | `/api/v1/projects/:projectId/issues` | `POST` | Allowed | Allowed | Denied (404) | Allowed | Denied (404) | Create issue (Developer assignee = self or null) |
 | `/api/v1/projects/:projectId/issues` | `GET` | Allowed | Allowed | Denied (404) | Allowed | Denied (404) | Filter, sort, paginate, and search issues |
 | `/api/v1/issues/:issueId` | `GET` | Allowed | Allowed | Denied (404) | Allowed | Denied (404) | Fetch single issue by ObjectId or key |
-| `/api/v1/issues/:issueId/transitions` | `POST` | Allowed | Full Lifecycle | Denied (404) | Allowed (T1, T2, T3, T7) | Denied (404) | State machine execution; T4 QA gate enforced |
+| `/api/v1/issues/:issueId/transitions` | `POST` | Allowed (T1-T8) | Allowed (T1-T8) | Denied (404) | Allowed (T1, T2, T3, T6, T8) | Denied (404) | State machine execution (T4/T5/T7 Lead/Admin; T4 self-close forbidden) |
 | `/api/v1/issues/:issueId/assignee` | `PUT` | Any Member | Any Member | Denied (404) | Self-claim or unclaim | Denied (404) | Work allocation & developer self-claiming |
 | `/api/v1/issues/:issueId/priority` | `PATCH` | Allowed | Allowed | Denied (404) | Creator / Assignee | Denied (404) | Issue priority modification |
 | `/api/v1/issues/:issueId/comments` | `POST` | Allowed | Allowed | Denied (404) | Allowed | Denied (404) | Create discussion comment |
@@ -819,11 +819,24 @@ Executes a lifecycle state transition governed by the deterministic state machin
     "reason": "Starting development work on sprint ticket"
   }
   ```
+- **Authoritative Lifecycle Transition Mapping (Phase 1 §6.3 / Phase 2 §4 / `issueStateMachine.js`):**
+
+| ID | From Status | To Status | Permitted Actors / Authorization | Mandatory Reason | OCC Enforced | Self-Assignment / Auto-Claim | Emitted Activity Action |
+|:---|:---|:---|:---|:---:|:---:|:---|:---|
+| **T1** | `Open` | `In_Progress` | Current Assignee, Project `Lead`, `Admin` | No | Yes | Auto-claims unassigned issue to caller | `STATUS_CHANGED`, `ASSIGNEE_CHANGED` (if claimed) |
+| **T2** | `In_Progress` | `Open` | Current Assignee, Project `Lead`, `Admin` | **Yes** | Yes | None | `STATUS_CHANGED` |
+| **T3** | `In_Progress` | `Resolved` | Current Assignee, Project `Lead`, `Admin` | No | Yes | None | `STATUS_CHANGED` |
+| **T4** | `Resolved` | `Closed` | Project `Lead`, `Admin` (**Assignee Forbidden: `SELF_CLOSE_FORBIDDEN`**) | No | Yes | None (Independent QA gate) | `STATUS_CHANGED` |
+| **T5** | `Open` | `Closed` | Project `Lead`, `Admin` | **Yes** | Yes | None | `STATUS_CHANGED` |
+| **T6** | `Resolved` | `Reopened` | Enrolled Project Member, Project `Lead`, `Admin` | No | Yes | None | `STATUS_CHANGED` |
+| **T7** | `Closed` | `Reopened` | Project `Lead`, `Admin` | No | Yes | None | `STATUS_CHANGED` |
+| **T8** | `Reopened` | `In_Progress` | Current Assignee, Project `Lead`, `Admin` | No | Yes | Auto-claims unassigned issue to caller | `STATUS_CHANGED`, `ASSIGNEE_CHANGED` (if claimed) |
+
 - **Validation Rules & Invariants:**
   - `toStatus`: Valid target per state machine (e.g. `Open` $\to$ `In_Progress`).
   - `expectedVersion`: Non-negative integer matching current issue `version`.
-  - `reason`: Mandatory string for T2 (`In_Progress` $\to$ `Open`) and T5 (`Open` $\to$ `Closed`).
-  - **QA Verification Gate (T4):** The assignee is strictly prohibited from executing `Resolved` $\to$ `Closed`. Requires `Lead` or `Admin`.
+  - `reason`: Mandatory non-empty string for T2 (`In_Progress` $\to$ `Open`) and T5 (`Open` $\to$ `Closed`).
+  - **QA Verification Gate (T4):** The assignee is strictly prohibited from executing `Resolved` $\to$ `Closed` (`SELF_CLOSE_FORBIDDEN`). Requires project `Lead` or `Admin`.
   - **Auto-Claim (T1 / T8):** If ticket is unassigned and moving to `In_Progress`, automatically assigns to the calling developer.
 - **Response (200 OK):**
   ```json
@@ -950,6 +963,24 @@ Deletes a comment.
 ---
 
 ### 6.6 Activity Feeds & Audit Trail
+
+The Activity log is strictly **append-only** and backed by Mongoose query/document pre-hooks blocking all updates and deletions (`APPEND_ONLY_VIOLATION`). There are NO update or delete REST endpoints for activity.
+
+#### Authoritative Activity Action Catalog (`backend/src/config/constants.js`):
+1. `ISSUE_CREATED`: Issued when a ticket is created.
+2. `ISSUE_UPDATED`: Issued when ticket core metadata (title/description) is updated.
+3. `STATUS_CHANGED`: Issued on every lifecycle state transition.
+4. `ASSIGNEE_CHANGED`: Issued on work claiming, reassignment, or offboarding unassignment/transfer.
+5. `PRIORITY_CHANGED`: Issued on priority escalation or reduction.
+6. `COMMENT_ADDED`: Issued when a comment is posted.
+7. `COMMENT_EDITED`: Issued when an author updates comment content (Phase 1 §3.1.4, constants.js).
+8. `COMMENT_DELETED`: Issued when an author or moderator removes a comment.
+9. `PROJECT_CREATED`: Issued on initial project creation.
+10. `PROJECT_MEMBER_ADDED`: Issued when a user is enrolled into the project roster.
+11. `PROJECT_MEMBER_REMOVED`: Issued when a member is offboarded.
+12. `PROJECT_ARCHIVED`: Issued when a project is archived into read-only mode.
+
+---
 
 #### 6.6.1 `GET /api/v1/issues/:issueId/activity`
 Retrieves reverse-chronological timeline of audit events for a specific issue.
