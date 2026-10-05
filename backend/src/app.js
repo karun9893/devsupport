@@ -29,20 +29,22 @@ app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 
 // Auth rate limiter for brute-force protection
-const authLimiter = rateLimit({
-  windowMs: env.authRateLimit.windowMs,
-  max: env.authRateLimit.max,
-  standardHeaders: true,
-  legacyHeaders: false,
-  handler: (req, res, next) => {
-    next(
-      AppError.badRequest(
-        'RATE_LIMIT_EXCEEDED',
-        'Too many authentication attempts. Please try again after 15 minutes.',
-      ),
-    );
-  },
-});
+const authLimiter = env.isTest
+  ? (req, res, next) => next()
+  : rateLimit({
+      windowMs: env.authRateLimit.windowMs,
+      max: env.authRateLimit.max,
+      standardHeaders: true,
+      legacyHeaders: false,
+      handler: (req, res, next) => {
+        next(
+          AppError.badRequest(
+            'RATE_LIMIT_EXCEEDED',
+            'Too many authentication attempts. Please try again after 15 minutes.',
+          ),
+        );
+      },
+    });
 
 // Liveness / Health check
 app.get('/health', (req, res) => {
@@ -55,14 +57,9 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Root API information endpoint
-app.get('/api/v1', (req, res) => {
-  res.status(200).json({
-    name: 'DevSupport API',
-    version: '1.0.0',
-    phase: 'Phase 2: Database & Architecture Implementation',
-  });
-});
+// Root API information endpoint & routes
+const createApiRouter = require('./routes');
+app.use('/api/v1', createApiRouter(authLimiter));
 
 // 404 Route Not Found Catch-all
 app.use((req, res, next) => {
